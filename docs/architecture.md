@@ -32,6 +32,29 @@ makes the failure mode structurally impossible.
 `stopBt`). Applications subclass it with their real board bring-up code;
 tests inject a `FakeHooks` that records calls.
 
+#### Contract: all radio bring-up MUST go through `RadioManager`
+
+The XOR guarantee is a **coordination** guarantee, not a hardware interlock.
+`RadioManager` always calls the active radio's stop hook and lets it return
+*before* calling the next radio's start hook — so the two are never
+initialized at once. But that only holds if the application upholds two rules:
+
+1. **Never bring up a radio outside `RadioManager`.** Do not call
+   `WiFi.begin()` / `NimBLEDevice::init()` (or the Pico W CYW43/BTstack
+   equivalents) directly from application code. Every transition goes through
+   `setMode()`; the reference demo does exactly this from `setup()` and from
+   its `mode wifi` / `mode bt` command handler.
+2. **Each stop hook MUST fully deinitialize its stack before returning**, so
+   the heap is reclaimed before the other radio starts. The reference hooks do
+   this: `stopWifi()` → `WiFi.mode(WIFI_OFF)` (deinitializes the WiFi driver),
+   `stopBt()` → `NimBLEDevice::deinit(true)` (frees the entire BLE stack). A
+   stop hook that merely *disconnects* (e.g. `WiFi.disconnect()` without
+   `WIFI_OFF`) leaves the stack resident and can defeat the heap guarantee on
+   RAM-constrained chips.
+
+Verify the heap is actually reclaimed across a switch on your target — see
+[hardware-bringup.md](hardware-bringup.md).
+
 ### `WgConfig` / `wgConfigParse` — wg-quick config parser
 
 Parses a standard `wg-quick` text block (`[Interface]` PrivateKey / Address,
@@ -84,9 +107,11 @@ timing-oracle attacks on the shared token.
 
 ### ESP32 — WireGuard backend (`backend_esp32.cpp`)
 
-Wraps `ciniml/WireGuard-ESP32` (lwIP-based). Implements `WgBackend::begin()`
-(configure keys + peer), `end()`, and `isUp()` (polls the library's
-handshake-received flag). Active only when `ARDUINO_ARCH_ESP32` is defined.
+Wraps `felipedadison/WireGuard-ESP32` (a fork of `ciniml/WireGuard-ESP32`
+updated for arduino-esp32 3.x / IDF5 — the original `#include`s the removed
+`tcpip_adapter.h`). lwIP-based. Implements `WgBackend::begin()` (configure
+keys + peer), `end()`, and `isUp()` (polls the library's handshake-received
+flag). Active only when `ARDUINO_ARCH_ESP32` is defined.
 
 ### ESP32 — BLE transport (`ble_nimble_esp32.cpp`)
 

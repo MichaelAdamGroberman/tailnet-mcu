@@ -212,6 +212,12 @@ CI pins Python 3.12 for both jobs.
 ~/.platformio/penv/bin/pio run -e pico-w   -d app/tailnet-sensor-node
 ```
 
+### Verify on hardware
+
+Tests + CI prove the logic and that it builds; on-device behavior (including
+that WiFi and BT truly never run at once and the heap is reclaimed across a
+mode switch) is verified with the [hardware bring-up checklist](docs/hardware-bringup.md).
+
 ---
 
 ## Security
