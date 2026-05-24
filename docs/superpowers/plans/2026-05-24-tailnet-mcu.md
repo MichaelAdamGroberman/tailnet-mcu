@@ -10,6 +10,13 @@
 
 **Spec:** `docs/superpowers/specs/2026-05-24-tailnet-mcu-design.md`
 
+> **⚠ REVISION 2 (2026-05-24):** The project gained **WiFi⊕BT mutually-exclusive
+> radio modes** and the **Tailscale tunnel is now OPTIONAL** (a WiFi-mode layer).
+> New components — `RadioManager`, `ServiceTransport` (BLE + TCP), BLE backends —
+> are defined in the **"Revision 2 Addendum"** at the bottom of this file, with the
+> revised task order. Tasks 7, 9, 10 below are amended there. Read the addendum
+> first; where it conflicts with Tasks 1–12, the addendum wins.
+
 ---
 
 ## File structure
@@ -1255,3 +1262,277 @@ Then enable branch protection on `main`, Dependabot/secret-scanning alerts, and 
 **Placeholder scan:** No "TBD/TODO" in code steps. The one genuine unknown — the Pico W WireGuard library name — is handled as an explicit spike (Task 5 Step 1) with a leading candidate and a "match the actual header" instruction, not a fabricated API. Doc tasks (10) specify exact required sections + facts rather than "write docs."
 
 **Type consistency:** `WgConfig` fields (`if_addr`, `if_priv`, `peer_pub`, `peer_host`, `peer_port`, `valid`) used identically in Tasks 2,3,4,5. `WgBackend` methods (`begin`/`end`/`isUp`) consistent across the interface (Task 3) and both backends (Tasks 4,5). `TailnetPeer` API (`begin`/`tick`/`stop`/`state`/`tunnelIP`/`peerEndpoint`/`lastError`/`State::{OFF,STARTING,UP,FAILED}`) consistent across Tasks 3,6,7,9. `TcpTokenListener(port, token)` + `onLine`/`begin`/`tick` consistent across Tasks 7,9.
+
+---
+
+# Revision 2 Addendum — radio modes & transports (2026-05-24)
+
+**What changed:** WiFi and BT are now mutually-exclusive runtime transports; a
+`RadioManager` enforces WiFi⊕BT. A `ServiceTransport` abstraction serves the
+same user `Handler` over BLE (BT mode) or token-gated TCP (WiFi mode). The
+`TailnetPeer` WireGuard tunnel is now **optional** — started only in WiFi mode
+when a config is supplied. BLE: ESP32 NimBLE (proven) + Pico W BTstack (spike,
+may degrade to documented-stub).
+
+**Revised task order:** 1 ✓ → 2 (parser) → **2A RadioManager** → 3 (TailnetPeer,
+now optional) → **2B ServiceTransport + token gate + TCP** → **2C BLE transports**
+→ 4,5 (WG backends) → 6 (minimal_tunnel) → 7 (→ **superseded by 2B/2C + new
+`mode_switch` example**) → 8 (gateway) → 9 (demo, **amended**) → 10 (docs,
+**amended**) → 11 (CI, add BLE) → 12.
+
+---
+
+### Task 2A: `RadioManager` — WiFi⊕BT invariant (TDD, host-native)
+
+**Files:** Create `src/RadioManager.h`, `src/RadioManager.cpp`; Test `test/test_radiomanager/test_radiomanager.cpp`
+
+- [ ] **Step 1: Write failing tests** — `test/test_radiomanager/test_radiomanager.cpp`:
+```cpp
+#include <unity.h>
+#include "RadioManager.h"
+
+// Fake radio hooks: track on/off state and assert WiFi & BT are NEVER both on.
+struct FakeHooks : RadioHooks {
+  bool wifi=false, bt=false; bool everBoth=false; bool failNext=false;
+  bool startWifi() override { if(failNext){failNext=false;return false;} wifi=true; check(); return true; }
+  void stopWifi()  override { wifi=false; }
+  bool startBt()   override { if(failNext){failNext=false;return false;} bt=true; check(); return true; }
+  void stopBt()    override { bt=false; }
+  void check(){ if(wifi&&bt) everBoth=true; }
+};
+void setUp(){} void tearDown(){}
+
+void test_starts_off(){ FakeHooks h; RadioManager r(&h); TEST_ASSERT_EQUAL(RadioManager::OFF, r.mode()); }
+void test_off_to_wifi(){ FakeHooks h; RadioManager r(&h);
+  TEST_ASSERT_TRUE(r.setMode(RadioManager::WIFI));
+  TEST_ASSERT_EQUAL(RadioManager::WIFI, r.mode()); TEST_ASSERT_TRUE(h.wifi); TEST_ASSERT_FALSE(h.bt); }
+void test_wifi_to_bt_is_exclusive(){ FakeHooks h; RadioManager r(&h);
+  r.setMode(RadioManager::WIFI); TEST_ASSERT_TRUE(r.setMode(RadioManager::BT));
+  TEST_ASSERT_EQUAL(RadioManager::BT, r.mode());
+  TEST_ASSERT_FALSE(h.wifi); TEST_ASSERT_TRUE(h.bt);
+  TEST_ASSERT_FALSE(h.everBoth); }      // never both on at once
+void test_same_mode_noop(){ FakeHooks h; RadioManager r(&h);
+  r.setMode(RadioManager::WIFI); TEST_ASSERT_TRUE(r.setMode(RadioManager::WIFI));
+  TEST_ASSERT_EQUAL(RadioManager::WIFI, r.mode()); }
+void test_start_failure_leaves_off(){ FakeHooks h; RadioManager r(&h);
+  h.failNext=true; TEST_ASSERT_FALSE(r.setMode(RadioManager::WIFI));
+  TEST_ASSERT_EQUAL(RadioManager::OFF, r.mode()); TEST_ASSERT_FALSE(h.wifi); }
+int main(int,char**){ UNITY_BEGIN();
+  RUN_TEST(test_starts_off); RUN_TEST(test_off_to_wifi);
+  RUN_TEST(test_wifi_to_bt_is_exclusive); RUN_TEST(test_same_mode_noop);
+  RUN_TEST(test_start_failure_leaves_off); return UNITY_END(); }
+```
+
+- [ ] **Step 2: Create `src/RadioManager.h`**
+```cpp
+#pragma once
+// Board radio control behind an interface so the WiFi⊕BT invariant is
+// host-testable with a fake. Real hooks live in the demo/examples and call
+// WiFi.mode(WIFI_OFF)/NimBLEDevice::deinit (ESP32) or the CYW43/BTstack
+// equivalents (Pico W).
+class RadioHooks {
+public:
+  virtual ~RadioHooks() {}
+  virtual bool startWifi() = 0;
+  virtual void stopWifi()  = 0;
+  virtual bool startBt()   = 0;
+  virtual void stopBt()    = 0;
+};
+
+class RadioManager {
+public:
+  enum Mode { OFF, WIFI, BT };
+  explicit RadioManager(RadioHooks* hooks) : _hooks(hooks) {}
+  bool setMode(Mode m);   // ALWAYS stops the active radio before starting next
+  Mode mode() const { return _mode; }
+private:
+  RadioHooks* _hooks;
+  Mode _mode = OFF;
+};
+```
+
+- [ ] **Step 3: run native test → FAIL.** `sudo -u michaelgroberman pio test -e native -d <repo> -f test_radiomanager`
+
+- [ ] **Step 4: Create `src/RadioManager.cpp`**
+```cpp
+#include "RadioManager.h"
+bool RadioManager::setMode(Mode m) {
+  if (m == _mode) return true;
+  // XOR invariant: power down whatever is active BEFORE bringing up the next.
+  if (_mode == WIFI) _hooks->stopWifi();
+  else if (_mode == BT) _hooks->stopBt();
+  _mode = OFF;
+  if (m == WIFI) { if (!_hooks->startWifi()) return false; _mode = WIFI; }
+  else if (m == BT) { if (!_hooks->startBt()) return false; _mode = BT; }
+  return true;
+}
+```
+
+- [ ] **Step 5: native test → PASS.** **Step 6: commit** `feat: RadioManager enforces WiFi-XOR-BT (TDD)`.
+
+---
+
+### Task 2B: `ServiceTransport` + constant-time token gate + TCP transport
+
+> Supersedes Task 7's `TcpTokenListener`. The token gate is host-tested (security-relevant); the Arduino transport is compile-gated.
+
+**Files:** Create `src/transport/token_gate.{h,cpp}`, `src/transport/service_transport.h`, `src/transport/tcp_service_transport.{h,cpp}`; Test `test/test_token_gate/test_token_gate.cpp`
+
+- [ ] **Step 1: Write failing token-gate tests** — `test/test_token_gate/test_token_gate.cpp`:
+```cpp
+#include <unity.h>
+#include "transport/token_gate.h"
+void setUp(){} void tearDown(){}
+void test_equal_true(){ TEST_ASSERT_TRUE(tokenEquals("s3cret-token","s3cret-token")); }
+void test_diff_false(){ TEST_ASSERT_FALSE(tokenEquals("s3cret-token","wrong-token!!")); }
+void test_prefix_false(){ TEST_ASSERT_FALSE(tokenEquals("s3cret","s3cret-token")); }
+void test_empty_inputs(){ TEST_ASSERT_FALSE(tokenEquals("", "x")); TEST_ASSERT_FALSE(tokenEquals(0,"x")); }
+int main(int,char**){ UNITY_BEGIN();
+  RUN_TEST(test_equal_true); RUN_TEST(test_diff_false);
+  RUN_TEST(test_prefix_false); RUN_TEST(test_empty_inputs); return UNITY_END(); }
+```
+
+- [ ] **Step 2: `src/transport/token_gate.h`**
+```cpp
+#pragma once
+// Constant-time token comparison: folds length + every byte into one diff
+// accumulator so compare time does not depend on the matching prefix length.
+bool tokenEquals(const char* got, const char* expected);
+```
+
+- [ ] **Step 3: native test → FAIL.**
+
+- [ ] **Step 4: `src/transport/token_gate.cpp`**
+```cpp
+#include "transport/token_gate.h"
+#include <string.h>
+bool tokenEquals(const char* got, const char* expected) {
+  if (!got || !expected) return false;
+  size_t lg = strlen(got), le = strlen(expected);
+  unsigned char diff = (unsigned char)((lg ^ le) != 0);
+  for (size_t i = 0; i < le; i++) {
+    unsigned char g = (i < lg) ? (unsigned char)got[i] : 0;
+    diff |= (unsigned char)(g ^ (unsigned char)expected[i]);
+  }
+  return diff == 0;
+}
+```
+> Native include path: tests reference `transport/token_gate.h`; ensure the `native` env build flags add `-Isrc` (add `build_src_flags = -Isrc` or `-I src` to `[env:native]` if includes don't resolve).
+
+- [ ] **Step 5: native test → PASS. Commit** `feat: constant-time token gate (TDD)`.
+
+- [ ] **Step 6: `src/transport/service_transport.h`** (Arduino; compile-gated by use in board envs)
+```cpp
+#pragma once
+#include <Arduino.h>
+#include <functional>
+// One Handler, served over whichever radio is active.
+class ServiceTransport {
+public:
+  using Handler = std::function<String(const String& line)>;
+  virtual ~ServiceTransport() {}
+  virtual bool begin() = 0;   // start listening/advertising
+  virtual void tick()  = 0;   // call from loop()
+  void onLine(Handler h) { _handler = h; }
+protected:
+  Handler _handler;
+};
+```
+
+- [ ] **Step 7: `src/transport/tcp_service_transport.{h,cpp}`**
+```cpp
+// tcp_service_transport.h
+#pragma once
+#include "service_transport.h"
+#include <WiFi.h>
+class TcpServiceTransport : public ServiceTransport {
+public:
+  TcpServiceTransport(uint16_t port, const char* token) : _srv(port), _token(token) {}
+  bool begin() override { _srv.begin(); return true; }
+  void tick() override;
+private:
+  WiFiServer _srv;
+  String _token;
+};
+```
+```cpp
+// tcp_service_transport.cpp
+#include "transport/tcp_service_transport.h"
+#include "transport/token_gate.h"
+void TcpServiceTransport::tick() {
+  WiFiClient c = _srv.available();
+  if (!c) return;
+  String first = c.readStringUntil('\n'); first.trim();
+  if (!tokenEquals(first.c_str(), _token.c_str())) { c.stop(); return; }  // silent drop
+  while (c.connected()) {
+    if (!c.available()) { delay(5); continue; }
+    String line = c.readStringUntil('\n'); line.trim();
+    if (line.length() == 0) break;
+    if (_handler) c.println(_handler(line));
+  }
+  c.stop();
+}
+```
+
+- [ ] **Step 8: compile-verify on esp32-s3 (via an example or the demo). Commit** `feat: ServiceTransport interface + token-gated TCP transport`.
+
+---
+
+### Task 2C: BLE transports — NimBLE (ESP32) + BTstack (Pico W spike)
+
+**Files:** Create `src/transport/ble_service_transport.h`, `src/transport/ble/ble_nimble_esp32.cpp`, `src/transport/ble/ble_btstack_pico.cpp`; Modify `platformio.ini` (NimBLE dep on esp32-s3; BTstack note on pico-w).
+
+**GATT contract (both backends implement identically):**
+- Advertise as the given service name. NUS-style service.
+- **RX characteristic** (write / write-no-response): client writes one command line. The **first** line on a fresh connection must equal the token (`tokenEquals`); otherwise ignore further writes / disconnect.
+- **TX characteristic** (notify): the `Handler`'s return string is sent as a notification.
+
+- [ ] **Step 1: `src/transport/ble_service_transport.h`**
+```cpp
+#pragma once
+#include "service_transport.h"
+// Compile-gated backend: ESP32 -> NimBLE; RP2040 -> BTstack (spike).
+class BleServiceTransport : public ServiceTransport {
+public:
+  BleServiceTransport(const char* name, const char* token);
+  bool begin() override;
+  void tick() override;
+private:
+  const char* _name;
+  const char* _token;
+  bool _authed = false;   // first valid token seen this connection
+};
+```
+
+- [ ] **Step 2: ESP32 NimBLE backend** — `src/transport/ble/ble_nimble_esp32.cpp`, guarded `#if defined(ARDUINO_ARCH_ESP32)`. Use `h2zero/NimBLE-Arduino @ ^2.2.0` (proven in the buddy). Implement: `NimBLEDevice::init(_name)`, create a server + NUS service (RX `6e400002-...`, TX `6e400003-...`, service `6e400001-b5a3-f393-e0a9-e50e24dcca9e`), an `onWrite` callback that buffers to newline, gates the first line with `tokenEquals`, calls `_handler`, and notifies the TX char with the response. `begin()` starts advertising; `tick()` is a no-op (NimBLE is callback-driven). Add `lib_deps += h2zero/NimBLE-Arduino @ ^2.2.0` to `[env:esp32-s3]`.
+
+- [ ] **Step 3: Pico W BTstack backend — SPIKE** — `src/transport/ble/ble_btstack_pico.cpp`, guarded `#if defined(ARDUINO_ARCH_RP2040)`. Confirm the arduino-pico BTstack BLE peripheral API (the core ships BTstack; check `pio pkg show` / arduino-pico docs for the `BTstackLib`/`BLEServer`-style peripheral API). Implement the same NUS GATT contract. **If BTstack peripheral GATT proves too costly to integrate cleanly in this session, degrade to:** a compile-gated stub whose `begin()` returns `false` and logs "BLE not yet supported on Pico W — see docs/roadmap", and document the limitation in README + `docs/architecture.md`. Record the decision in the commit message. Do NOT block the rest of the plan on this.
+
+- [ ] **Step 4: compile-verify esp32-s3 (BLE must link). pico-w must at least compile (real backend or stub). Commit** `feat: BLE service transport — NimBLE (ESP32) + Pico W BTstack/stub`.
+
+---
+
+### Amendments to existing tasks
+
+- **Task 7 (TcpTokenListener + reachable_service):** SUPERSEDED. The listener becomes `TcpServiceTransport` (Task 2B). Replace the `reachable_service` example with a **`mode_switch` example**: boots in `DEFAULT_MODE`, serves a `Handler` over the active transport, and switches WiFi⇄BT on the reserved `mode wifi`/`mode bt` command via `RadioManager`. Compile both boards.
+
+- **Task 9 (demo app):** AMENDED. `tailnet-sensor-node` now:
+  1. Builds a `RadioManager` with real `RadioHooks` (ESP32: `WiFi.mode`/NimBLE deinit; Pico W: CYW43/BTstack).
+  2. Boots into `DEFAULT_MODE` (from `secrets.h`).
+  3. Binds the sensor `Handler` to the active transport (`BleServiceTransport` in BT, `TcpServiceTransport` in WiFi).
+  4. In WiFi mode, **if `WG_CONFIG` is defined**, brings up `TailnetPeer` (optional); otherwise serves LAN-only.
+  5. Handles `mode wifi`/`mode bt` to switch radios.
+  `secrets.example.h` adds `DEFAULT_MODE`, `SERVICE_TOKEN`, and makes `WG_CONFIG` clearly optional (commented how to omit).
+
+- **Task 10 (docs):** AMENDED. README + `docs/architecture.md` must cover the WiFi⊕BT model and `RadioManager`. Add **`docs/provisioning.md` section "Enabling the optional Tailscale tunnel"** — step-by-step opt-in: run the gateway script, get the config, define `WG_CONFIG`; explain that omitting it keeps WiFi mode LAN-only and BT mode unaffected. `docs/security-model.md` adds the BLE-transport bullet (local-range, token-gated, LE Secure Connections recommended).
+
+- **Task 11 (CI):** add NimBLE to the esp32-s3 example builds; ensure native test job runs `test_radiomanager` and `test_token_gate` too (it runs all `test/` dirs by default).
+
+### Revision 2 self-review
+
+- Spec §2 (radio modes/transports) → Tasks 2A, 2B, 2C ✓
+- Spec §2 (Tailscale optional) → Task 9 amendment (conditional `TailnetPeer`) ✓
+- Spec §4 (RadioManager/ServiceTransport API) → Tasks 2A, 2B ✓
+- Spec §6 (BLE local-range + token, constant-time) → Tasks 2B (token gate), 2C (BLE), 10 ✓
+- Spec §7 (RadioManager + token-gate host tests) → Tasks 2A, 2B ✓
+- **Type consistency (Rev 2):** `RadioManager::Mode::{OFF,WIFI,BT}` + `setMode`/`mode` consistent (2A, 9, mode_switch). `RadioHooks::{startWifi,stopWifi,startBt,stopBt}` consistent (2A, 9). `ServiceTransport::{begin,tick,onLine,Handler}` consistent (2B, 2C, 7→mode_switch, 9). `tokenEquals(got, expected)` consistent (2B, TCP + BLE). `TailnetPeer` unchanged.

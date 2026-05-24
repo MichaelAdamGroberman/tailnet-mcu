@@ -1,7 +1,8 @@
 # tailnet-mcu — Design Spec
 
 **Date:** 2026-05-24
-**Status:** Approved (design); pending implementation plan
+**Status:** Approved — **Revision 2** (2026-05-24): added WiFi⊕BT radio modes;
+Tailscale tunnel is now an *optional* WiFi-mode layer, not the centerpiece.
 **Location:** `~/Projects/tailnet-mcu/`
 **License:** MIT (preserving upstream BSD notices for `wireguard-lwip`)
 
@@ -9,22 +10,69 @@
 
 ## 1. Purpose
 
-Let a microcontroller (ESP32 family, Raspberry Pi Pico W) join a user's
-Tailscale network and be reachable from any tailnet node — **without
-exposing any service to the public internet**. Today no turnkey,
-multi-board, security-first project does this; existing examples are
-single-board WireGuard demos with no Tailscale story and no hardening
-guidance.
+Give a microcontroller (ESP32 family, Raspberry Pi Pico W) a simple
+connectivity layer with two **mutually exclusive** runtime transports —
+**WiFi** or **Bluetooth LE** — and, *as an optional add-on in WiFi mode*,
+a WireGuard tunnel that joins the device to the user's Tailscale network,
+reachable from any tailnet node **without exposing any service to the
+public internet**. That optional Tailscale tunnel is the novel piece:
+today no turnkey, multi-board, security-first project does it; existing
+examples are single-board WireGuard demos with no Tailscale story and no
+hardening guidance.
 
 The deliverable is two layers in one public repo:
 
-1. A **reusable Arduino/PlatformIO library** (`TailnetPeer`) that users
-   drop into their own projects — one API, two board backends.
+1. A **reusable Arduino/PlatformIO library** that users drop into their
+   own projects: a `RadioManager` (enforces WiFi⊕BT), a `ServiceTransport`
+   abstraction with BLE and TCP implementations, and an *optional*
+   `TailnetPeer` WireGuard tunnel — one API surface, two board backends
+   for each radio.
 2. A **demo app** built on that library — a *private IoT sensor node* —
-   that makes the "reachable on my tailnet, invisible to the public"
-   value concrete.
+   that serves the same reading over BLE (local) or TCP (LAN), and
+   optionally tailnet-wide when the WireGuard tunnel is enabled.
 
-## 2. Core architecture & honest framing
+## 2. Operating model — radio modes & transports (Revision 2)
+
+The device runs in exactly **one** `RadioMode` at a time — `OFF`, `WIFI`,
+or `BT` — and a `RadioManager` enforces that invariant: switching modes
+**always powers down the active radio before bringing up the next**. This
+is not tidiness; on a single-radio chip (e.g. ESP32-PICO-D4) WiFi + BLE
+coexistence is a hard heap ceiling (Bluedroid + WiFi starved the WiFi
+driver of RAM in the `claude-desktop-buddy` work). WiFi⊕BT means the
+device only ever pays for one stack's heap.
+
+A `ServiceTransport` interface exposes one command `Handler`
+(`"read" → reading`). The user writes their service logic **once** and
+binds it to whichever transport the active mode provides:
+
+- `BleServiceTransport` — BLE GATT, NUS-style (write char in / notify char
+  out). Local range, no IP, no tunnel. ESP32 = NimBLE; Pico W = BTstack.
+- `TcpServiceTransport` — token-gated TCP. WiFi mode; reachable
+  tailnet-wide **iff** the optional `TailnetPeer` tunnel is up, otherwise
+  LAN-only.
+
+```
+                 ┌──────────── RadioManager (enforces WiFi⊕BT) ────────────┐
+   boot/cmd ──▶  │   OFF ⇄ WIFI ⇄ BT     stopActive() before startNext()   │
+                 └───────┬──────────────────────────────────┬──────────────┘
+                         │ WIFI                              │ BT
+                ┌────────▼──────────┐               ┌────────▼─────────┐
+   one Handler  │ TcpServiceTransport│              │ BleServiceTransport│  same Handler
+   (your logic) │  + OPTIONAL        │              │  (NimBLE / BTstack)│  (your logic)
+                │    TailnetPeer     │              └───────────────────┘
+                └───────────────────┘
+```
+
+**Mode selection:** boot mode from config (`DEFAULT_MODE`); runtime switch
+via a reserved service command (`mode wifi` / `mode bt`) routed through
+`RadioManager`; an optional hardware button is documented as
+board-dependent.
+
+**The Tailscale tunnel is opt-in.** `TailnetPeer` is started only in WiFi
+mode and only when a WG config is supplied. With no config, WiFi mode
+still serves over plain LAN TCP. §2A below describes that optional layer.
+
+## 2A. WireGuard tunnel architecture — the optional layer (honest framing)
 
 The MCU does **not** run Tailscale. It runs a vanilla WireGuard client
 and joins the tailnet *through a subnet router* — an existing Tailscale
@@ -80,12 +128,20 @@ Two documented paths, identical firmware, differing only in `Endpoint`:
 ```
 tailnet-mcu/
   src/                          # the library
-    TailnetPeer.{h,cpp}         # state machine + wg-quick parser (portable)
-    backends/backend_esp32.cpp  # ciniml/WireGuard-ESP32
-    backends/backend_pico_w.cpp # wireguard-lwip on arduino-pico lwIP
+    RadioManager.{h,cpp}        # WiFi⊕BT mode state machine (portable; board radio hooks)
+    WgConfig.{h,cpp}            # wg-quick parser (portable, host-tested)
+    TailnetPeer.{h,cpp}         # OPTIONAL WireGuard tunnel state machine (WiFi mode)
+    backends/wg_backend.h       # WgBackend interface
+    backends/backend_esp32.cpp  # ciniml/WireGuard-ESP32        (#ifdef ESP32)
+    backends/backend_pico_w.cpp # wireguard-lwip on arduino-pico (#ifdef RP2040)
+    transport/service_transport.h         # ServiceTransport interface + Handler
+    transport/tcp_service_transport.{h,cpp}  # token-gated TCP (WiFi mode)
+    transport/ble_service_transport.h        # BLE transport interface decl
+    transport/ble/ble_nimble_esp32.cpp       # NimBLE GATT      (#ifdef ESP32)
+    transport/ble/ble_btstack_pico.cpp       # BTstack GATT     (#ifdef RP2040, spike)
   examples/
-    minimal_tunnel/             # connect; confirm handshake UP; reach a tailnet host
-    reachable_service/          # token-gated TCP listener bound to the tunnel iface
+    minimal_tunnel/             # WiFi mode + optional tunnel; reach a tailnet host
+    mode_switch/                # boot BT, switch to WiFi at runtime via command
   app/tailnet-sensor-node/      # demo app (layer 2); own platformio.ini
     src/main.cpp
     secrets.example.h
@@ -109,6 +165,28 @@ tailnet-mcu/
 ## 4. Public API (sketch — finalized during planning)
 
 ```cpp
+// Enforces WiFi⊕BT. Board radio start/stop behind a hook so the mode
+// logic is host-testable with a fake.
+class RadioManager {
+public:
+  enum Mode { OFF, WIFI, BT };
+  bool setMode(Mode m);     // stops the active radio first; false on failure
+  Mode mode() const;
+};
+
+// Same service logic over either radio.
+class ServiceTransport {
+public:
+  using Handler = std::function<String(const String& line)>;
+  virtual ~ServiceTransport() {}
+  virtual bool begin() = 0;
+  virtual void tick() = 0;          // call from loop()
+  void onLine(Handler h);
+};
+// Implementations: TcpServiceTransport(port, token) [WiFi];
+//                  BleServiceTransport(serviceName) [BT].
+
+// OPTIONAL — only meaningful in WIFI mode.
 class TailnetPeer {
 public:
   enum State { OFF, STARTING, UP, FAILED };
@@ -117,8 +195,8 @@ public:
   void        tick();                              // call from loop(); polls handshake
   void        stop();
   State       state() const;
-  const char* tunnelIP() const;                    // our address on the tunnel
-  const char* peerEndpoint() const;                // host:port we dial
+  const char* tunnelIP() const;
+  const char* peerEndpoint() const;
   const char* lastError() const;
 };
 ```
@@ -130,12 +208,13 @@ Address (backends want a bare IP); splits `host:port`.
 ## 5. Provisioning
 
 - **Demo app + examples:** compile-time `secrets.h` (gitignored) holding
-  the `wg-quick` text; `secrets.example.h` is committed. Dead simple, no
-  BLE.
+  WiFi creds, the optional `wg-quick` text, the BLE service token, and a
+  `DEFAULT_MODE` (`WIFI` or `BT`); `secrets.example.h` is committed.
 - **Runtime (library feature):** `loadConfigFromText()` lets advanced
-  users paste a config over serial.
-- **Explicitly out of scope:** the buddy's BLE/NimBLE provisioning — it
-  is app-specific and drags in the Bluedroid-vs-NimBLE heap fight.
+  users paste a WG config over serial; `mode wifi`/`mode bt` over the
+  active transport switches radios at runtime.
+- **The WG config is optional** — omit it and WiFi mode serves over plain
+  LAN TCP with no tunnel.
 
 ## 6. Security model (first-class doc + enforced defaults)
 
@@ -147,6 +226,11 @@ Address (backends want a bare IP); splits `host:port`.
   no banner, no unauthenticated code path to fuzz.
 - **Nothing public behind the tunnel.** Device services (e.g. the demo's
   sensor endpoint) are reachable only from inside the tailnet.
+- **BLE transport is local-range + token-gated.** BLE GATT has no IP
+  exposure and only reaches devices in radio range. The same shared-token
+  first-line check used by TCP gates the BLE write characteristic; LE
+  Secure Connections pairing/bonding is documented as the recommended
+  hardening on top.
 
 Enforced defaults baked into scripts/docs:
 
@@ -166,11 +250,14 @@ Enforced defaults baked into scripts/docs:
 
 ## 7. Testing strategy
 
-1. **Host-native unit tests** for the `wg-quick` parser (pure string
-   logic; runs in PlatformIO `native` env, no hardware).
+1. **Host-native unit tests** (PlatformIO `native` env, no hardware) for
+   the pure logic: the `wg-quick` parser, the `TailnetPeer` state machine
+   (FakeBackend), the `RadioManager` WiFi⊕BT invariant (fake radio hooks),
+   and `ServiceTransport` handler dispatch (fake transport).
 2. **CI compile matrix** builds both board envs (esp32-s3, pico-w) on
-   every push to catch backend breakage.
-3. **Documented manual hardware bring-up checklist:** handshake reaches
+   every push to catch WG + BLE backend breakage.
+3. **Documented manual hardware bring-up checklist:** mode switch powers
+   exactly one radio; BLE GATT read works in range; handshake reaches
    `UP`; device reachable from a tailnet node at its tunnel IP; `nmap`
    against the gateway confirms the WireGuard port is scanner-silent.
 
@@ -194,13 +281,21 @@ Enforced defaults baked into scripts/docs:
 | Boards | ESP32 (S3 = WiFi default) + Raspberry Pi Pico W | Two chips makers actually own; one Arduino/PlatformIO toolchain, one API, two backends |
 | Deliverable | Library + demo app, two layers | Matches "incorporate into their projects" while showing a tangible showcase |
 | Demo app | Private IoT sensor node | Makes the "tailnet-private, never public" security story concrete |
-| Provisioning | Compile-time `secrets.h`; runtime serial paste as library feature | Simple default; no BLE/NimBLE complexity |
+| **Radios (Rev 2)** | **WiFi⊕BT, mutually exclusive via RadioManager** | Single-radio chips can't run both stacks' heap; XOR sidesteps the buddy's coexistence fight |
+| **Tailscale tunnel (Rev 2)** | **Optional WiFi-mode layer, not required** | Library is useful for BLE-only / plain-LAN users; tunnel is the marquee opt-in feature |
+| **Transports (Rev 2)** | **`ServiceTransport` abstraction: BLE (NimBLE/BTstack) + TCP** | Write service logic once, serve over whichever radio is active |
+| **BLE scope (Rev 2)** | **Both boards; Pico W BTstack as a spike, degrades to documented-stub** | ESP32 NimBLE proven; Pico W BLE is real integration risk, must not block v1 |
+| Provisioning | Compile-time `secrets.h` (+ `DEFAULT_MODE`); runtime serial paste + `mode` command | Simple default; runtime mode switch for flexibility |
 | License | MIT | Permissive; compatible with BSD `wireguard-lwip` (notices preserved) |
 | Name / location | `tailnet-mcu` / `~/Projects/tailnet-mcu/` | Board-neutral; alongside mac-mcp / linux-mcp |
 
 ## 10. Out of scope (v1)
 
-- BLE/serial-portal provisioning (buddy-specific).
+- BLE/softAP *provisioning portal* (buddy-specific). BLE is in scope as a
+  runtime service transport, not as a config-provisioning UI.
+- Simultaneous WiFi + BT (explicitly forbidden by the WiFi⊕BT invariant).
+- Running BLE and the WireGuard tunnel at the same time (BLE is BT mode;
+  the tunnel is WiFi mode — mutually exclusive by design).
 - Roaming failover between multiple gateway endpoints (one reachable
   endpoint suffices; dial the public node when away).
 - Boards beyond ESP32 family + Pico W.
