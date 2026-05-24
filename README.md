@@ -1,4 +1,4 @@
-<!-- Badges — fill in real URLs after CI is wired and repo is published -->
+<!-- Badges resolve once the repo is published on GitHub and CI has run -->
 ![CI](https://github.com/MichaelAdamGroberman/tailnet-mcu/actions/workflows/ci.yml/badge.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![PlatformIO Registry](https://badges.registry.platformio.org/packages/michaeladamgroberman/library/tailnet-mcu.svg)
