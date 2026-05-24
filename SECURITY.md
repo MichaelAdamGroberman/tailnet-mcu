@@ -16,7 +16,7 @@ Report vulnerabilities privately via
 GitHub routes the report directly to the maintainer without public disclosure.
 
 You can also reach the maintainer via LinkedIn:
-[REPLACE-ME — fill in your LinkedIn profile URL before publishing]
+[Michael Groberman](https://www.linkedin.com/in/michael-adam-groberman/)
 
 Please include:
 - A description of the vulnerability and the affected component.

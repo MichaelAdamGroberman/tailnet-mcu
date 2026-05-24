@@ -45,9 +45,11 @@ an individual is officially representing the community in public spaces.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the project maintainers responsible for enforcement via GitHub
-(open a private Security Advisory or contact the maintainer — see `SECURITY.md`).
-All complaints will be reviewed and investigated promptly and fairly.
+reported to the project maintainer responsible for enforcement via a private
+GitHub Security Advisory or LinkedIn
+([Michael Groberman](https://www.linkedin.com/in/michael-adam-groberman/)) —
+see `SECURITY.md`. All complaints will be reviewed and investigated promptly
+and fairly.
 
 ## Attribution
 
