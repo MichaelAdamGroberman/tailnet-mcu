@@ -1,0 +1,13 @@
+{
+  "tagOwners": { "tag:iot-gateway": ["autogroup:admin"] },
+  "acls": [
+    { "action": "accept",
+      "src": ["autogroup:member"],
+      "dst": ["10.20.30.0/24:*"],
+      "comment": "tailnet members may reach the MCU subnet" },
+    { "action": "accept",
+      "src": ["10.20.30.0/24"],
+      "dst": ["tag:iot-gateway:*"],
+      "comment": "MCU may reach only the gateway by default — widen deliberately" }
+  ]
+}
